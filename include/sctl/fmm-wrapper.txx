@@ -192,6 +192,13 @@ template <class Real, Integer DIM> struct ParticleFMM<Real,DIM>::S2TData {
   mutable bool setup_tree = false;
   mutable bool setup_ker = false;
   bool pvfmm_compat = true; // PVFMM can evaluate ker_s2t
+
+  // The near field (PVFMM's U-list: the interactions between adjacent leaves), summed here from the original
+  // coordinates instead of by PVFMM from its mapped ones (see EvalPVFMM). Per target leaf l: its targets
+  // near_trg[near_trg_dsp[l] .. near_trg_dsp[l+1]-1] and the sources of its U-list near_src[near_src_dsp[l] ..
+  // near_src_dsp[l+1]-1] (indices into the target and source data).
+  mutable bool near_here = false;
+  mutable Vector<Long> near_trg_dsp, near_trg, near_src_dsp, near_src;
   #endif
 };
 
@@ -1093,6 +1100,38 @@ template <class Real, Integer DIM> void ParticleFMM<Real,DIM>::EvalPVFMM(Vector<
         }
         tree_ptr = PtFMM_CreateTree(sl_coord_, sl_den_, dl_coord_, dl_den_, trg_coord_, comm_, max_pts, pvfmm_bc);
         tree_ptr->SetupFMM(&fmm_ctx);
+        // The near field here, from the original coordinates: the map into PVFMM's unit box above rounds each
+        // coordinate on its own, so PVFMM's U-list is off by ~1e-16/r relative for a pair a distance r apart, while
+        // the far field (pairs at least a leaf apart) is not affected. One process, free space (the U-list of a
+        // periodic or distributed tree holds images and ghost leaves).
+        s2t_data.near_here = (periodicity_ == Periodicity::NONE && comm_.Size() == 1);
+        tree_ptr->skip_ulist = s2t_data.near_here;
+        if (s2t_data.near_here) { // the targets of every target leaf and the sources PVFMM's U-list sums directly for it
+          // (as FMM_Pts::U_ListSetup: the adjacent leaves (U0, U1, U2), the X-list leaves when the target leaf has at
+          // most Nsrf targets, and the W-list leaves with at most Nsrf sources, Nsrf the points of an expansion surface)
+          const Long m_ = fmm_ctx.MultipoleOrder(), Nsrf = 6*(m_-1)*(m_-1)+2;
+          std::vector<Long> trg_dsp(1, 0), trg_idx, src_dsp(1, 0), src_idx;
+          const auto& nodes = tree_ptr->GetNodeList();
+          for (const auto& n : nodes) {
+            if (!n->IsLeaf() || n->IsGhost() || !n->trg_scatter.Dim()) continue;
+            for (Long i = 0; i < n->trg_scatter.Dim(); i++) trg_idx.push_back(n->trg_scatter[i]);
+            const auto add = [&](const pvfmm::Mat_Type t, const bool x_list, const bool w_list) {
+              if (x_list && (Long)n->pt_cnt[1] > Nsrf) return;
+              for (const auto& s : n->interac_list[t]) {
+                if (s == sctl::NullIterator<pvfmm::PtFMM_Node<Real>>() || !s->IsLeaf()) continue;
+                if (w_list && (Long)s->pt_cnt[0] > Nsrf) continue;
+                const auto& scatter = (NorDim ? s->surf_scatter : s->src_scatter);
+                for (Long i = 0; i < scatter.Dim(); i++) src_idx.push_back(scatter[i]);
+              }
+            };
+            add(pvfmm::U0_Type, false, false); add(pvfmm::U1_Type, false, false); add(pvfmm::U2_Type, false, false);
+            add(pvfmm::X_Type, true, false); add(pvfmm::W_Type, false, true);
+            trg_dsp.push_back((Long)trg_idx.size());
+            src_dsp.push_back((Long)src_idx.size());
+          }
+          s2t_data.near_trg_dsp = Vector<Long>(trg_dsp); s2t_data.near_trg = Vector<Long>(trg_idx);
+          s2t_data.near_src_dsp = Vector<Long>(src_dsp); s2t_data.near_src = Vector<Long>(src_idx);
+        }
         s2t_data.setup_tree = false;
       } else {
         tree_ptr->ClearFMMData();
@@ -1123,6 +1162,31 @@ template <class Real, Integer DIM> void ParticleFMM<Real,DIM>::EvalPVFMM(Vector<
       for (Long i = 0; i < Nt; i++) {
         for (Long j = 0; j < TrgDim; j++) {
           U[i*TrgDim+j] += trg_value[i*TrgDim+j] * trg_scal[j];
+        }
+      }
+      if (s2t_data.near_here) { // the near field: each target leaf against its U-list, original coordinates, full accuracy
+        const auto& trg_dsp = s2t_data.near_trg_dsp; const auto& trg_idx = s2t_data.near_trg;
+        const auto& src_dsp = s2t_data.near_src_dsp; const auto& src_idx = s2t_data.near_src;
+        const Long Nleaf = trg_dsp.Dim() - 1;
+        #pragma omp parallel
+        {
+          Vector<Real> Xt_, Xs_, Xn_, F_, U_;
+          #pragma omp for schedule(dynamic)
+          for (Long l = 0; l < Nleaf; l++) {
+            const Long t0 = trg_dsp[l], nt = trg_dsp[l+1] - t0, s0 = src_dsp[l], ns = src_dsp[l+1] - s0;
+            if (!nt || !ns) continue;
+            Xt_.ReInit(nt*DIM); Xs_.ReInit(ns*DIM); Xn_.ReInit(ns*NorDim); F_.ReInit(ns*SrcDim);
+            for (Long i = 0; i < nt; i++) for (Integer k = 0; k < DIM; k++) Xt_[i*DIM+k] = Xt[trg_idx[t0+i]*DIM+k];
+            for (Long i = 0; i < ns; i++) {
+              const Long j = src_idx[s0+i];
+              for (Integer k = 0; k < DIM; k++) Xs_[i*DIM+k] = Xs[j*DIM+k];
+              for (Integer k = 0; k < NorDim; k++) Xn_[i*NorDim+k] = Xn[j*NorDim+k];
+              for (Integer k = 0; k < SrcDim; k++) F_[i*SrcDim+k] = F[j*SrcDim+k];
+            }
+            U_.ReInit(nt*TrgDim); U_.SetZero();
+            s2t_data.ker_s2t_eval(U_, Xt_, Xs_, Xn_, F_, -1, s2t_data.ker_s2t);
+            for (Long i = 0; i < nt; i++) for (Integer j = 0; j < TrgDim; j++) U[trg_idx[t0+i]*TrgDim+j] += U_[i*TrgDim+j];
+          }
         }
       }
     }

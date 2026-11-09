@@ -5,6 +5,10 @@
 #ifndef _SCTL_FMM_WRAPPER_HPP_
 #define _SCTL_FMM_WRAPPER_HPP_
 
+// ParticleFMM sums the near field (the interactions PVFMM evaluates directly) itself, from the original coordinates,
+// so close source-target pairs keep full relative accuracy (one process, free space; see ParticleFMM::EvalPVFMM)
+#define SCTL_FMM_EXACT_NEAR 1
+
 #include <map>                   // for map
 #include <string>                // for basic_string, string
 #include <utility>               // for pair
